@@ -68,6 +68,7 @@ class Predictor(cog.Predictor):
         preserve_color,
         num_iter,
         alpha,
+        lambda_cycle: float=1.0
     ):
 
         device = "cuda"  # 'cuda' or 'cpu'
@@ -82,8 +83,10 @@ class Predictor(cog.Predictor):
         )
         original_generator.load_state_dict(ckpt["g_ema"], strict=False)
 
-        # to be finetuned generator
-        generator = deepcopy(original_generator)
+        # to be finetuned generators
+        cartoon_generator = deepcopy(original_generator)
+        human_generator = deepcopy(original_generator)
+
 
         transform = transforms.Compose(
             [
@@ -95,9 +98,11 @@ class Predictor(cog.Predictor):
 
         # aligns and crops face
         aligned_face = align_face(str(input_face))
+        aligned_cartoon_face = align_face(str(style_img_0))
 
         my_w = e4e_projection(aligned_face, "input_face.pt", device).unsqueeze(0)
-
+        cartoon_w = e4e_projection(aligned_cartoon_face, "cartoon_face.pt", device).unsqueeze(0)
+    
         if pretrained is not None:
             if (
                 preserve_color
@@ -111,86 +116,141 @@ class Predictor(cog.Predictor):
             ckpt = torch.load(
                 os.path.join("models", ckpt), map_location=lambda storage, loc: storage
             )
-            generator.load_state_dict(ckpt["g"], strict=False)
+            cartoon_generator.load_state_dict(ckpt["g"], strict=False)
 
             with torch.no_grad():
-                generator.eval()
-                stylized_face = generator(my_w, input_is_latent=True)
+                cartoon_generator.eval()
+                stylized_face = cartoon_generator(my_w, input_is_latent=True)
 
         else:
             # finetune with new style images
-            targets = []
-            latents = []
+            cartoon_targets = []
+            cartoon_latents = []
 
-            style_imgs = [style_img_0, style_img_1, style_img_2, style_img_3]
+            cartoon_imgs = [style_img_0, style_img_1, style_img_2, style_img_3]
 
             # Remove None values
-            style_imgs = [i for i in style_imgs if i]
+            cartoon_imgs = [i for i in cartoon_imgs if i]
 
-            for ind, style_img in enumerate(style_imgs):
+            for ind, cartoon_img in enumerate(cartoon_imgs):
 
                 # crop and align the face
-                style_aligned = align_face(str(style_img))
+                cartoon_style_aligned = align_face(str(cartoon_img))
 
-                out_path = f"style_aligned_{ind}.jpg"
-                style_aligned.save(str(out_path))
+                out_path = f"cartoon_style_aligned_{ind}.jpg"
+                cartoon_style_aligned.save(str(out_path))
 
                 # GAN invert
-                latent = e4e_projection(style_aligned, f"style_img_{ind}.pt", device)
+                latent = e4e_projection(cartoon_style_aligned, f"style_img_{ind}.pt", device)
 
-                targets.append(transform(style_aligned).to(device))
-                latents.append(latent.to(device))
+                cartoon_targets.append(transform(cartoon_style_aligned).to(device))
+                cartoon_latents.append(latent.to(device))
 
-            targets = torch.stack(targets, 0)
-            latents = torch.stack(latents, 0)
+            cartoon_targets = torch.stack(cartoon_targets, 0)
+            cartoon_latents = torch.stack(cartoon_latents, 0) # latents are from human domain
+
+            # Do the same operations above for second generator
+            human_imgs = [input_face]
+            human_targets = []
+            human_latents = []
+            for ind, human_img in enumerate(human_imgs):
+
+                # crop and align the face
+                human_style_aligned = align_face(str(human_img))
+
+                out_path = f"human_style_aligned_{ind}.jpg"
+                human_style_aligned.save(str(out_path))
+
+                # GAN invert
+                latent = e4e_projection(human_style_aligned, f"style_img_{ind}.pt", device)
+
+                human_targets.append(transform(human_style_aligned).to(device))
+                human_latents.append(latent.to(device))
+
+            human_targets = torch.stack(human_targets, 0)
+            human_latents = torch.stack(human_latents, 0)
+
 
             alpha = 1 - alpha
             # load discriminator for perceptual loss
-            discriminator = Discriminator(1024, 2).eval().to(device)
+            cartoon_discriminator = Discriminator(1024, 2).eval().to(device)
+            human_discriminator = Discriminator(1024, 2).eval().to(device)
+
             ckpt = torch.load(
                 "models/stylegan2-ffhq-config-f.pt",
                 map_location=lambda storage, loc: storage,
             )
-            discriminator.load_state_dict(ckpt["d"], strict=False)
+            cartoon_discriminator.load_state_dict(ckpt["d"], strict=False)
 
-            g_optim = optim.Adam(generator.parameters(), lr=2e-3, betas=(0, 0.99))
+            cartoon_g_optim = optim.Adam(cartoon_generator.parameters(), lr=2e-3, betas=(0, 0.99))
+            human_g_optim = optim.Adam(human_generator.parameters(), lr=2e-3, betas=(0, 0.99))
 
             # Which layers to swap for generating a family of plausible real images -> fake image
             if preserve_color:
                 id_swap = [9, 11, 15, 16, 17]
             else:
-                id_swap = list(range(7, generator.n_latent))
+                id_swap = list(range(7, cartoon_generator.n_latent))
 
             for idx in tqdm(range(num_iter)):
-                mean_w = (
-                    generator.get_latent(
-                        torch.randn([latents.size(0), latent_dim]).to(device)
+                cartoon_mean_w = (
+                    cartoon_generator.get_latent(
+                        torch.randn([cartoon_latents.size(0), latent_dim]).to(device)
                     )
                     .unsqueeze(1)
-                    .repeat(1, generator.n_latent, 1)
+                    .repeat(1, cartoon_generator.n_latent, 1)
                 )
-                in_latent = latents.clone()
-                in_latent[:, id_swap] = (
-                    alpha * latents[:, id_swap] + (1 - alpha) * mean_w[:, id_swap]
+                in_cartoon_latent = cartoon_latents.clone()
+                in_cartoon_latent[:, id_swap] = (
+                    alpha * cartoon_latents[:, id_swap] + (1 - alpha) * cartoon_mean_w[:, id_swap]
                 )
 
-                img = generator(in_latent, input_is_latent=True)
+                human_mean_w = (
+                    human_generator.get_latent(
+                        torch.randn([human_latents.size(0), latent_dim]).to(device)
+                    )
+                    .unsqueeze(1)
+                    .repeat(1, human_generator.n_latent, 1)
+                )
+                in_human_latent = human_latents.clone()
+                in_human_latent[:, id_swap] = (
+                    alpha * human_latents[:, id_swap] + (1 - alpha) * human_mean_w[:, id_swap]
+                )
+
+                fake_cartoon_img = cartoon_generator(in_cartoon_latent, input_is_latent=True)
+                fake_human_img = human_generator(in_human_latent, input_is_latent=True)
 
                 with torch.no_grad():
-                    real_feat = discriminator(targets)
-                fake_feat = discriminator(img)
+                    real_cartoon_feat = cartoon_discriminator(cartoon_targets)
+                    real_human_feat = human_discriminator(human_targets)
+                fake_cartoon_feat = cartoon_discriminator(fake_cartoon_img)
+                fake_human_feat = human_discriminator(fake_human_img)
 
-                loss = sum(
-                    [F.l1_loss(a, b) for a, b in zip(fake_feat, real_feat)]
-                ) / len(fake_feat)
+                cartoon_loss = sum(
+                    [F.l1_loss(a, b) for a, b in zip(fake_cartoon_feat, real_cartoon_feat)]
+                ) / len(fake_cartoon_feat)
+                human_loss = sum(
+                    [F.l1_loss(a, b) for a, b in zip(fake_human_feat, real_human_feat)]
+                ) / len(fake_human_feat)
 
-                g_optim.zero_grad()
-                loss.backward()
-                g_optim.step()
+                # Cycle loss
+                cycle_cartoon = cartoon_generator(fake_human_img)
+                cycle_human = human_generator(fake_cartoon_img)
+                cycle_cartoon_loss = F.l1_loss(cartoon_targets, cycle_cartoon)
+                cycle_human_loss = F.l1_loss(human_targets, cycle_human)
+
+                cartoon_loss += lambda_cycle * cycle_cartoon_loss
+                human_loss += lambda_cycle * cycle_human_loss
+
+                cartoon_g_optim.zero_grad()
+                human_g_optim.zero_grad()
+                cartoon_loss.backward()
+                human_loss.backward()
+                cartoon_g_optim.step()
+                human_g_optim.step()
 
             with torch.no_grad():
-                generator.eval()
-                stylized_face = generator(my_w, input_is_latent=True)
+                cartoon_generator.eval()
+                stylized_face = cartoon_generator(my_w, input_is_latent=True)
 
         stylized_face = stylized_face.cpu()
         np.save("stylized_face.npy", stylized_face)
