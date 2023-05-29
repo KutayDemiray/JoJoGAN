@@ -11,14 +11,14 @@ from util import *
 
 @ torch.no_grad()
 def projection(img, name, net, device='cuda'):
-    """
-    model_path = 'models/e4e_ffhq_encode.pt'
-    ckpt = torch.load(model_path, map_location='cpu')
-    opts = ckpt['opts']
-    opts['checkpoint_path'] = model_path
-    opts= Namespace(**opts)
-    net = pSp(opts, device).eval().to(device)
-    """
+    if net is None:
+        model_path = 'models/e4e_ffhq_encode.pt'
+        ckpt = torch.load(model_path, map_location='cpu')
+        opts = ckpt['opts']
+        opts['checkpoint_path'] = model_path
+        opts= Namespace(**opts)
+        net = pSp(opts, device).eval().to(device)
+    
     transform = transforms.Compose(
         [
             transforms.Resize(256),
